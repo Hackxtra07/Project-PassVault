@@ -41,22 +41,30 @@ SALT_BYTES = 16                 # salt bytes to store per user
 # ----------------------------- DB SETUP -----------------------------
 def get_db():
     try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        # Check if URI is still the default placeholder
+        if "cluster0.mongodb.net" in MONGO_URI:
+            return "PLACEHOLDER"
+            
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
         # Check connection
         client.server_info()
         return client[DB_NAME]
     except Exception as e:
-        messagebox.showerror("Database Error", f"Could not connect to MongoDB Atlas: {e}")
+        print(f"Database Connection Error: {e}")
         return None
 
 def initialize_database():
     db = get_db()
-    if db is None: return
+    if db is None or db == "PLACEHOLDER": 
+        return
     # MongoDB creates collections on first insert, but we can create indexes
-    db.users.create_index("username", unique=True)
-    db.credentials.create_index([("user_id", pymongo.ASCENDING), ("title", pymongo.ASCENDING)])
-    db.credentials.create_index([("user_id", pymongo.ASCENDING), ("category", pymongo.ASCENDING)])
-    db.credentials.create_index([("user_id", pymongo.ASCENDING), ("updated_at", pymongo.DESCENDING)])
+    try:
+        db.users.create_index("username", unique=True)
+        db.credentials.create_index([("user_id", pymongo.ASCENDING), ("title", pymongo.ASCENDING)])
+        db.credentials.create_index([("user_id", pymongo.ASCENDING), ("category", pymongo.ASCENDING)])
+        db.credentials.create_index([("user_id", pymongo.ASCENDING), ("updated_at", pymongo.DESCENDING)])
+    except Exception as e:
+        print(f"Error creating indexes: {e}")
 
 # ----------------------------- CRYPTO HELPERS -----------------------------
 def derive_key(master_password: str, salt: bytes, iterations=PBKDF2_ITERATIONS) -> bytes:
@@ -237,7 +245,13 @@ class PasswordManagerApp:
             pw_hash = hash_master_password(p1)
             try:
                 db = get_db()
-                if db is None: return
+                if db == "PLACEHOLDER":
+                    messagebox.showwarning("Setup Required", "Please update the MONGO_URI in your .env file with your real MongoDB Atlas connection string.")
+                    return
+                if db is None:
+                    messagebox.showerror("Error", "Could not connect to database.")
+                    return
+                    
                 user_doc = {
                     "username": username,
                     "password_hash": pw_hash,
@@ -259,7 +273,13 @@ class PasswordManagerApp:
             messagebox.showerror("Error", "Enter username and password")
             return
         db = get_db()
-        if db is None: return
+        if db == "PLACEHOLDER":
+            messagebox.showwarning("Setup Required", "Please update the MONGO_URI in your .env file with your real MongoDB Atlas connection string.")
+            return
+        if db is None:
+            messagebox.showerror("Error", "Could not connect to database. Please check your internet connection and MONGO_URI.")
+            return
+            
         row = db.users.find_one({"username": username})
         if not row:
             messagebox.showerror("Error", "User not found")
