@@ -10,7 +10,11 @@ import time
 import threading
 import base64
 import secrets
-import sqlite3
+# import sqlite3  # Deprecated in favor of MongoDB
+import pymongo
+from pymongo import MongoClient
+from bson.objectid import ObjectId
+from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -25,7 +29,9 @@ import pyperclip
 import string
 
 # ----------------------------- CONFIG -----------------------------
-DB_FILE = "vault.db"
+load_dotenv()
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://admin:password@cluster.mongodb.net/?retryWrites=true&w=majority")
+DB_NAME = "passVault"
 
 AUTO_CLEAR_SECONDS = 15          # clipboard clear seconds
 AUTO_LOCK_MINUTES = 5           # lock app after inactivity
@@ -33,43 +39,24 @@ PBKDF2_ITERATIONS = 200_000     # key derivation iterations
 SALT_BYTES = 16                 # salt bytes to store per user
 
 # ----------------------------- DB SETUP -----------------------------
-def get_connection():
-    conn = sqlite3.connect(DB_FILE, detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
-    conn.row_factory = sqlite3.Row
-    # enforce foreign keys
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+def get_db():
+    try:
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        # Check connection
+        client.server_info()
+        return client[DB_NAME]
+    except Exception as e:
+        messagebox.showerror("Database Error", f"Could not connect to MongoDB Atlas: {e}")
+        return None
 
 def initialize_database():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password_hash BLOB NOT NULL,
-        salt BLOB NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS credentials (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        title TEXT NOT NULL,
-        username TEXT,
-        password_blob BLOB NOT NULL,
-        notes TEXT,
-        category TEXT,
-        tags TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_used TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    )
-    """)
-    conn.commit()
-    conn.close()
+    db = get_db()
+    if db is None: return
+    # MongoDB creates collections on first insert, but we can create indexes
+    db.users.create_index("username", unique=True)
+    db.credentials.create_index([("user_id", pymongo.ASCENDING), ("title", pymongo.ASCENDING)])
+    db.credentials.create_index([("user_id", pymongo.ASCENDING), ("category", pymongo.ASCENDING)])
+    db.credentials.create_index([("user_id", pymongo.ASCENDING), ("updated_at", pymongo.DESCENDING)])
 
 # ----------------------------- CRYPTO HELPERS -----------------------------
 def derive_key(master_password: str, salt: bytes, iterations=PBKDF2_ITERATIONS) -> bytes:
@@ -249,14 +236,18 @@ class PasswordManagerApp:
             salt = os.urandom(SALT_BYTES)
             pw_hash = hash_master_password(p1)
             try:
-                conn = get_connection()
-                cur = conn.cursor()
-                cur.execute("INSERT INTO users (username, password_hash, salt) VALUES (?, ?, ?)", (username, pw_hash, salt))
-                conn.commit()
-                conn.close()
+                db = get_db()
+                if db is None: return
+                user_doc = {
+                    "username": username,
+                    "password_hash": pw_hash,
+                    "salt": salt,
+                    "created_at": datetime.utcnow()
+                }
+                db.users.insert_one(user_doc)
                 messagebox.showinfo("Success", "Account created. Please login.")
                 win.destroy()
-            except sqlite3.IntegrityError:
+            except pymongo.errors.DuplicateKeyError:
                 messagebox.showerror("Error", "Username already exists.")
 
         tk.Button(win, text="Create", command=create).grid(row=3, column=0, columnspan=2, pady=8)
@@ -267,15 +258,13 @@ class PasswordManagerApp:
         if not username or not pw:
             messagebox.showerror("Error", "Enter username and password")
             return
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT id,password_hash,salt FROM users WHERE username=?", (username,))
-        row = cur.fetchone()
-        conn.close()
+        db = get_db()
+        if db is None: return
+        row = db.users.find_one({"username": username})
         if not row:
             messagebox.showerror("Error", "User not found")
             return
-        user_id = row["id"]
+        user_id = str(row["_id"])
         pw_hash = row["password_hash"]
         salt = row["salt"]
         if not check_master_password(pw, pw_hash):
@@ -299,37 +288,37 @@ class PasswordManagerApp:
     def load_credentials(self):
         if not self.user: return
         q = self.search_var.get().strip()
-        conn = get_connection()
-        cur = conn.cursor()
+        db = get_db()
+        if db is None: return
+        
+        filter_query = {"user_id": self.user['id']}
         if q:
-            qlike = f"%{q}%"
-            cur.execute("""SELECT id,title,username,category,tags,updated_at 
-                           FROM credentials 
-                           WHERE user_id=? AND (title LIKE ? OR username LIKE ? OR category LIKE ? OR tags LIKE ?) 
-                           ORDER BY updated_at DESC""", (self.user['id'], qlike, qlike, qlike, qlike))
-        else:
-            cur.execute("SELECT id,title,username,category,tags,updated_at FROM credentials WHERE user_id=? ORDER BY updated_at DESC", (self.user['id'],))
-        rows = cur.fetchall()
-        conn.close()
+            filter_query["$or"] = [
+                {"title": {"$regex": q, "$options": "i"}},
+                {"username": {"$regex": q, "$options": "i"}},
+                {"category": {"$regex": q, "$options": "i"}},
+                {"tags": {"$regex": q, "$options": "i"}}
+            ]
+        
+        rows = list(db.credentials.find(filter_query).sort("updated_at", pymongo.DESCENDING))
+        
         for r in self.tree.get_children():
             self.tree.delete(r)
         for row in rows:
-            self.tree.insert("", "end", values=(row["id"], row["title"], row["username"], row["category"], row["tags"], row["updated_at"]))
+            self.tree.insert("", "end", values=(str(row["_id"]), row.get("title"), row.get("username"), row.get("category"), row.get("tags"), row.get("updated_at")))
 
     def on_select_credential(self, event):
         sel = self.tree.selection()
         if not sel: return
         item = self.tree.item(sel[0])['values']
         cid = item[0]
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT title,username,password_blob,notes,category,tags,created_at,updated_at,last_used FROM credentials WHERE id=? AND user_id=?", (cid, self.user['id']))
-        row = cur.fetchone()
-        conn.close()
+        db = get_db()
+        if db is None: return
+        row = db.credentials.find_one({"_id": ObjectId(cid), "user_id": self.user['id']})
         if row:
-            title = row["title"]; username = row["username"]; blob = row["password_blob"]
-            notes = row["notes"]; category = row["category"]; tags = row["tags"]
-            created_at = row["created_at"]; updated_at = row["updated_at"]; last_used = row["last_used"]
+            title = row.get("title"); username = row.get("username"); blob = row.get("password_blob")
+            notes = row.get("notes"); category = row.get("category"); tags = row.get("tags")
+            created_at = row.get("created_at"); updated_at = row.get("updated_at"); last_used = row.get("last_used")
             try:
                 clear_text = decrypt_blob(self.fernet, blob)
             except Exception:
@@ -371,12 +360,20 @@ class PasswordManagerApp:
             messagebox.showerror("Error", "Title and password required")
             return
         blob = encrypt_blob(self.fernet, password)
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO credentials (user_id,title,username,password_blob,notes,category,tags) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (self.user['id'], title, username, blob, notes, category, tags))
-        conn.commit()
-        conn.close()
+        db = get_db()
+        if db is None: return
+        doc = {
+            "user_id": self.user['id'],
+            "title": title,
+            "username": username,
+            "password_blob": blob,
+            "notes": notes,
+            "category": category,
+            "tags": tags,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        db.credentials.insert_one(doc)
         messagebox.showinfo("Saved", "Credential saved")
         win.destroy()
         self.load_credentials()
@@ -385,14 +382,12 @@ class PasswordManagerApp:
         sel = self.tree.selection()
         if not sel: return
         cid = self.tree.item(sel[0])['values'][0]
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT title,username,password_blob,notes,category,tags FROM credentials WHERE id=? AND user_id=?", (cid, self.user['id']))
-        row = cur.fetchone()
-        conn.close()
+        db = get_db()
+        if db is None: return
+        row = db.credentials.find_one({"_id": ObjectId(cid), "user_id": self.user['id']})
         if not row: return
-        title = row["title"]; username = row["username"]; blob = row["password_blob"]
-        notes = row["notes"]; category = row["category"]; tags = row["tags"]
+        title = row.get("title"); username = row.get("username"); blob = row.get("password_blob")
+        notes = row.get("notes"); category = row.get("category"); tags = row.get("tags")
         try:
             clear_pw = decrypt_blob(self.fernet, blob)
         except Exception:
@@ -424,12 +419,20 @@ class PasswordManagerApp:
                 messagebox.showerror("Error", "Title and password required")
                 return
             blob2 = encrypt_blob(self.fernet, p)
-            conn = get_connection()
-            cur = conn.cursor()
-            cur.execute("""UPDATE credentials SET title=?, username=?, password_blob=?, notes=?, category=?, tags=?, updated_at=CURRENT_TIMESTAMP
-                           WHERE id=? AND user_id=?""", (t, u, blob2, nt, cat, tg, cid, self.user['id']))
-            conn.commit()
-            conn.close()
+            db = get_db()
+            if db is None: return
+            db.credentials.update_one(
+                {"_id": ObjectId(cid), "user_id": self.user['id']},
+                {"$set": {
+                    "title": t,
+                    "username": u,
+                    "password_blob": blob2,
+                    "notes": nt,
+                    "category": cat,
+                    "tags": tg,
+                    "updated_at": datetime.utcnow()
+                }}
+            )
             messagebox.showinfo("Saved", "Credential updated")
             win.destroy()
             self.load_credentials()
@@ -444,11 +447,9 @@ class PasswordManagerApp:
         if not messagebox.askyesno("Confirm", "Delete selected credential?"):
             return
         cid = self.tree.item(sel[0])['values'][0]
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM credentials WHERE id=? AND user_id=?", (cid, self.user['id']))
-        conn.commit()
-        conn.close()
+        db = get_db()
+        if db is None: return
+        db.credentials.delete_one({"_id": ObjectId(cid), "user_id": self.user['id']})
         messagebox.showinfo("Deleted", "Credential deleted")
         self.load_credentials()
 
@@ -459,15 +460,13 @@ class PasswordManagerApp:
             messagebox.showerror("Error", "Select a credential")
             return
         cid = self.tree.item(sel[0])['values'][0]
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT password_blob FROM credentials WHERE id=? AND user_id=?", (cid, self.user['id']))
-        row = cur.fetchone()
-        conn.close()
+        db = get_db()
+        if db is None: return
+        row = db.credentials.find_one({"_id": ObjectId(cid), "user_id": self.user['id']})
         if not row:
             messagebox.showerror("Error", "Not found")
             return
-        blob = row["password_blob"]
+        blob = row.get("password_blob")
         try:
             pw = decrypt_blob(self.fernet, blob)
         except Exception:
@@ -477,11 +476,10 @@ class PasswordManagerApp:
         messagebox.showinfo("Copied", f"Password copied to clipboard. It will clear in {AUTO_CLEAR_SECONDS} seconds.")
         threading.Thread(target=self._clear_clipboard_after, daemon=True).start()
         # update last_used
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE credentials SET last_used=CURRENT_TIMESTAMP WHERE id=? AND user_id=?", (cid, self.user['id']))
-        conn.commit()
-        conn.close()
+        db.credentials.update_one(
+            {"_id": ObjectId(cid), "user_id": self.user['id']},
+            {"$set": {"last_used": datetime.utcnow()}}
+        )
 
     def _clear_clipboard_after(self):
         time.sleep(AUTO_CLEAR_SECONDS)
@@ -497,11 +495,9 @@ class PasswordManagerApp:
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON","*.json")])
         if not path:
             return
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT title,username,password_blob,notes,category,tags,created_at,updated_at FROM credentials WHERE user_id=?", (self.user['id'],))
-        rows = cur.fetchall()
-        conn.close()
+        db = get_db()
+        if db is None: return
+        rows = list(db.credentials.find({"user_id": self.user['id']}))
         out = {
             "meta": {"exported_at": datetime.utcnow().isoformat(), "user": self.user['username']},
             "salt": base64.b64encode(self.salt).decode() if self.salt else None,
@@ -509,14 +505,14 @@ class PasswordManagerApp:
         }
         for r in rows:
             out["items"].append({
-                "title": r["title"],
-                "username": r["username"],
-                "password_blob": base64.b64encode(r["password_blob"]).decode(),
-                "notes": r["notes"],
-                "category": r["category"],
-                "tags": r["tags"],
-                "created_at": r["created_at"],
-                "updated_at": r["updated_at"]
+                "title": r.get("title"),
+                "username": r.get("username"),
+                "password_blob": base64.b64encode(r.get("password_blob")).decode(),
+                "notes": r.get("notes"),
+                "category": r.get("category"),
+                "tags": r.get("tags"),
+                "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+                "updated_at": r.get("updated_at").isoformat() if r.get("updated_at") else None
             })
         with open(path, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=2)
@@ -539,15 +535,23 @@ class PasswordManagerApp:
                 if not messagebox.askyesno("Salt mismatch", "Export uses a different salt. Import may fail to decrypt. Continue?"):
                     return
         imported = 0
-        conn = get_connection()
-        cur = conn.cursor()
+        db = get_db()
+        if db is None: return
         for it in data.get("items", []):
             blob = base64.b64decode(it["password_blob"])
-            cur.execute("INSERT INTO credentials (user_id,title,username,password_blob,notes,category,tags) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (self.user['id'], it.get("title"), it.get("username"), blob, it.get("notes"), it.get("category"), it.get("tags")))
+            doc = {
+                "user_id": self.user['id'],
+                "title": it.get("title"),
+                "username": it.get("username"),
+                "password_blob": blob,
+                "notes": it.get("notes"),
+                "category": it.get("category"),
+                "tags": it.get("tags"),
+                "created_at": datetime.fromisoformat(it["created_at"]) if it.get("created_at") else datetime.utcnow(),
+                "updated_at": datetime.fromisoformat(it["updated_at"]) if it.get("updated_at") else datetime.utcnow()
+            }
+            db.credentials.insert_one(doc)
             imported += 1
-        conn.commit()
-        conn.close()
         messagebox.showinfo("Imported", f"Imported {imported} items.")
         self.load_credentials()
 
@@ -555,16 +559,14 @@ class PasswordManagerApp:
     def show_audit(self):
         if not self.user:
             return
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT id,title,password_blob,updated_at,last_used FROM credentials WHERE user_id=?", (self.user['id'],))
-        rows = cur.fetchall()
-        conn.close()
+        db = get_db()
+        if db is None: return
+        rows = list(db.credentials.find({"user_id": self.user['id']}))
         weak = []
         old = []
         now = datetime.utcnow()
         for r in rows:
-            cid = r["id"]; title = r["title"]; blob = r["password_blob"]
+            cid = str(r["_id"]); title = r.get("title"); blob = r.get("password_blob")
             try:
                 pwd = decrypt_blob(self.fernet, blob)
             except Exception:
@@ -572,7 +574,7 @@ class PasswordManagerApp:
             score = password_strength(pwd)
             if score <= 2:
                 weak.append((title, score))
-            updated_at = r["updated_at"]
+            updated_at = r.get("updated_at")
             if updated_at:
                 try:
                     # updated_at can be string; try parse

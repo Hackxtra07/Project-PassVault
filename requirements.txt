@@ -1,0 +1,6 @@
+pymongo[srv]
+python-dotenv
+cryptography
+bcrypt
+pyperclip
+tk
