@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Project Manager
+Comment=Launch my Python app in virtualenv
+Exec=gnome-terminal -- /home/hackxtra/Documents/Project-PassVault/Project-PassVault/run.sh
+Icon=/home/hackxtra/Documents/Project-PassVault/Project-PassVault/icon.png
+Terminal=false
+Path=
+StartupNotify=false
