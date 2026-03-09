@@ -10,14 +10,15 @@ import time
 import threading
 import base64
 import secrets
-# import sqlite3  # Deprecated in favor of MongoDB
+import sqlite3
+import socket
 import pymongo
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, Label
 
 # Crypto libs
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -30,7 +31,7 @@ import string
 
 # ----------------------------- CONFIG -----------------------------
 load_dotenv()
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://admin:password@cluster.mongodb.net/?retryWrites=true&w=majority")
+MONGO_URI = "mongodb+srv://manankamboj66_db_user:HeZJf1a7BKEQq3IF@globaldb.jmzxyvp.mongodb.net/?appName=GlobalDB"
 DB_NAME = "passVault"
 
 AUTO_CLEAR_SECONDS = 15          # clipboard clear seconds
@@ -38,33 +39,343 @@ AUTO_LOCK_MINUTES = 5           # lock app after inactivity
 PBKDF2_ITERATIONS = 200_000     # key derivation iterations
 SALT_BYTES = 16                 # salt bytes to store per user
 
-# ----------------------------- DB SETUP -----------------------------
-def get_db():
+# ----------------------------- HYBRID DB MANAGER -----------------------------
+def is_online():
+    """Check if internet connection is available."""
     try:
-        # Check if URI is still the default placeholder
-        if "cluster0.mongodb.net" in MONGO_URI:
-            return "PLACEHOLDER"
-            
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
-        # Check connection
-        client.server_info()
-        return client[DB_NAME]
-    except Exception as e:
-        print(f"Database Connection Error: {e}")
+        # Use a short timeout to check connectivity to a reliable host
+        socket.setdefaulttimeout(2)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("8.8.8.8", 53))
+        return True
+    except (socket.timeout, socket.error):
+        return False
+
+class HybridDatabase:
+    def __init__(self):
+        self.local_db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vault.db")
+        self.mongo_uri = MONGO_URI
+        self.db_name = DB_NAME
+        self.online = False
+        self.mongo_client = None
+        self.mongo_db = None
+        self.init_local_db()
+        self.check_connection()
+
+    def init_local_db(self):
+        conn = sqlite3.connect(self.local_db_path)
+        cursor = conn.cursor()
+        # Users table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                _id TEXT PRIMARY KEY,
+                username TEXT UNIQUE,
+                password_hash BLOB,
+                salt BLOB,
+                created_at TEXT
+            )
+        """)
+        # Credentials table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS credentials (
+                _id TEXT PRIMARY KEY,
+                user_id TEXT,
+                title TEXT,
+                username TEXT,
+                password_blob BLOB,
+                notes TEXT,
+                category TEXT,
+                tags TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                last_used TEXT,
+                sync_status TEXT DEFAULT 'synced'
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def check_connection(self):
+        self.online = is_online()
+        if self.online:
+            try:
+                if self.mongo_client is None:
+                    if "cluster0.mongodb.net" not in self.mongo_uri:
+                        self.mongo_client = MongoClient(self.mongo_uri, serverSelectionTimeoutMS=2000)
+                        self.mongo_db = self.mongo_client[self.db_name]
+                        # Verify connection
+                        self.mongo_client.server_info()
+                        # Create indexes
+                        self.mongo_db.users.create_index("username", unique=True)
+                        self.mongo_db.credentials.create_index([("user_id", pymongo.ASCENDING), ("title", pymongo.ASCENDING)])
+                        self.mongo_db.credentials.create_index([("user_id", pymongo.ASCENDING), ("category", pymongo.ASCENDING)])
+                        self.mongo_db.credentials.create_index([("user_id", pymongo.ASCENDING), ("updated_at", pymongo.DESCENDING)])
+                    else:
+                        self.online = False # Still placeholder
+                else:
+                    self.mongo_client.server_info()
+            except Exception:
+                self.online = False
+        return self.online
+
+    def get_collection(self, name):
+        return HybridCollection(self, name)
+
+    @property
+    def users(self):
+        return self.get_collection("users")
+
+    @property
+    def credentials(self):
+        return self.get_collection("credentials")
+
+class HybridCollection:
+    def __init__(self, db_manager, name):
+        self.db_manager = db_manager
+        self.name = name
+
+    def insert_one(self, doc):
+        # Ensure _id exists
+        if "_id" not in doc:
+            doc["_id"] = ObjectId()
+        
+        doc_copy = doc.copy()
+        str_id = str(doc_copy["_id"])
+        
+        # Save locally first
+        conn = sqlite3.connect(self.db_manager.local_db_path)
+        cursor = conn.cursor()
+        if self.name == "users":
+            cursor.execute(
+                "INSERT INTO users (_id, username, password_hash, salt, created_at) VALUES (?, ?, ?, ?, ?)",
+                (str_id, doc.get("username"), doc.get("password_hash"), doc.get("salt"), doc.get("created_at").isoformat() if isinstance(doc.get("created_at"), datetime) else str(doc.get("created_at")))
+            )
+        else: # credentials
+            cursor.execute(
+                """INSERT INTO credentials (_id, user_id, title, username, password_blob, notes, category, tags, created_at, updated_at, last_used, sync_status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str_id, doc.get("user_id"), doc.get("title"), doc.get("username"), doc.get("password_blob"), 
+                 doc.get("notes"), doc.get("category"), doc.get("tags"), 
+                 doc.get("created_at").isoformat() if isinstance(doc.get("created_at"), datetime) else str(doc.get("created_at")),
+                 doc.get("updated_at").isoformat() if isinstance(doc.get("updated_at"), datetime) else str(doc.get("updated_at")),
+                 doc.get("last_used").isoformat() if isinstance(doc.get("last_used"), datetime) else str(doc.get("last_used")),
+                 'pending_save' if not self.db_manager.online else 'synced')
+            )
+        conn.commit()
+        conn.close()
+
+        # Try online if connected
+        if self.db_manager.online and self.db_manager.mongo_db is not None:
+            try:
+                self.db_manager.mongo_db[self.name].insert_one(doc)
+            except pymongo.errors.DuplicateKeyError:
+                # Re-raise for UI handling
+                raise
+            except Exception as e:
+                print(f"Failed to insert online: {e}")
+
+    def find_one(self, query):
+        # Strategy: check online first if available, otherwise fallback to local
+        result = None
+        if self.db_manager.online and self.db_manager.mongo_db is not None:
+            try:
+                result = self.db_manager.mongo_db[self.name].find_one(query)
+                if result:
+                    # Cache locally
+                    self._cache_locally(result)
+                    return result
+            except Exception:
+                pass
+        
+        # Fallback to local
+        conn = sqlite3.connect(self.db_manager.local_db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        if self.name == "users":
+            if "username" in query:
+                cursor.execute("SELECT * FROM users WHERE username = ?", (query["username"],))
+            elif "_id" in query:
+                cursor.execute("SELECT * FROM users WHERE _id = ?", (str(query["_id"]),))
+        else: # credentials
+            if "_id" in query:
+                cursor.execute("SELECT * FROM credentials WHERE _id = ?", (str(query["_id"]),))
+            elif "user_id" in query and len(query) == 1:
+                cursor.execute("SELECT * FROM credentials WHERE user_id = ?", (query["user_id"],))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            res = dict(row)
+            res["_id"] = ObjectId(res["_id"]) if ObjectId.is_valid(res["_id"]) else res["_id"]
+            if "created_at" in res and res["created_at"]: res["created_at"] = self._parse_dt(res["created_at"])
+            if "updated_at" in res and res["updated_at"]: res["updated_at"] = self._parse_dt(res["updated_at"])
+            if "last_used" in res and res["last_used"]: res["last_used"] = self._parse_dt(res["last_used"])
+            return res
         return None
 
+    def find(self, query):
+        # We need a cursor-like object. For simplicity, we'll return a HybridCursor
+        return HybridCursor(self.db_manager, self.name, query)
+
+    def update_one(self, filter_query, update_data):
+        # Update local first
+        conn = sqlite3.connect(self.db_manager.local_db_path)
+        cursor = conn.cursor()
+        
+        set_clause = update_data.get("$set", {})
+        if self.name == "credentials":
+            str_id = str(filter_query.get("_id"))
+            
+            # Construct dynamic UPDATE query
+            fields = []
+            values = []
+            for k, v in set_clause.items():
+                if k == "updated_at" or k == "last_used":
+                    v = v.isoformat() if isinstance(v, datetime) else str(v)
+                fields.append(f"{k} = ?")
+                values.append(v)
+            
+            if not self.db_manager.online:
+                fields.append("sync_status = ?")
+                values.append('pending_save')
+            
+            query = f"UPDATE credentials SET {', '.join(fields)} WHERE _id = ?"
+            values.append(str_id)
+            cursor.execute(query, tuple(values))
+        
+        conn.commit()
+        conn.close()
+
+        # Update online
+        if self.db_manager.online and self.db_manager.mongo_db is not None:
+            try:
+                self.db_manager.mongo_db[self.name].update_one(filter_query, update_data)
+            except Exception as e:
+                print(f"Failed to update online: {e}")
+
+    def delete_one(self, filter_query):
+        str_id = str(filter_query.get("_id"))
+        
+        # Local handling
+        conn = sqlite3.connect(self.db_manager.local_db_path)
+        cursor = conn.cursor()
+        if self.db_manager.online:
+            cursor.execute(f"DELETE FROM {self.name} WHERE _id = ?", (str_id,))
+        else:
+            if self.name == "credentials":
+                # Mark for deletion when back online
+                cursor.execute("UPDATE credentials SET sync_status = 'pending_delete' WHERE _id = ?", (str_id,))
+            else:
+                cursor.execute(f"DELETE FROM {self.name} WHERE _id = ?", (str_id,))
+        conn.commit()
+        conn.close()
+
+        # Online handling
+        if self.db_manager.online and self.db_manager.mongo_db is not None:
+            try:
+                self.db_manager.mongo_db[self.name].delete_one(filter_query)
+            except Exception as e:
+                print(f"Failed to delete online: {e}")
+
+    def _cache_locally(self, doc):
+        conn = sqlite3.connect(self.db_manager.local_db_path)
+        cursor = conn.cursor()
+        str_id = str(doc["_id"])
+        if self.name == "users":
+            cursor.execute("INSERT OR REPLACE INTO users (_id, username, password_hash, salt, created_at) VALUES (?, ?, ?, ?, ?)",
+                (str_id, doc.get("username"), doc.get("password_hash"), doc.get("salt"), doc.get("created_at").isoformat() if isinstance(doc.get("created_at"), datetime) else str(doc.get("created_at"))))
+        else: # credentials
+            cursor.execute("""
+                INSERT OR REPLACE INTO credentials (_id, user_id, title, username, password_blob, notes, category, tags, created_at, updated_at, last_used, sync_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced')
+            """, (str_id, doc.get("user_id"), doc.get("title"), doc.get("username"), doc.get("password_blob"), 
+                  doc.get("notes"), doc.get("category"), doc.get("tags"),
+                  doc.get("created_at").isoformat() if isinstance(doc.get("created_at"), datetime) else str(doc.get("created_at")),
+                  doc.get("updated_at").isoformat() if isinstance(doc.get("updated_at"), datetime) else str(doc.get("updated_at")),
+                  doc.get("last_used").isoformat() if isinstance(doc.get("last_used"), datetime) else str(doc.get("last_used")) if doc.get("last_used") else None))
+        conn.commit()
+        conn.close()
+
+    def _parse_dt(self, val):
+        if val is None: return None
+        if isinstance(val, datetime): return val
+        try:
+            return datetime.fromisoformat(val)
+        except:
+            return val
+
+class HybridCursor:
+    def __init__(self, db_manager, collection_name, query):
+        self.db_manager = db_manager
+        self.collection_name = collection_name
+        self.query = query
+        self.sort_params = None
+        self._data = None
+
+    def sort(self, field, direction=1):
+        self.sort_params = (field, direction)
+        return self
+
+    def _fetch(self):
+        if self._data is not None: return
+        
+        # Priority: Online
+        if self.db_manager.online and self.db_manager.mongo_db is not None:
+            try:
+                cursor = self.db_manager.mongo_db[self.collection_name].find(self.query)
+                if self.sort_params:
+                    cursor = cursor.sort(self.sort_params[0], self.sort_params[1])
+                self._data = list(cursor)
+                return
+            except Exception:
+                pass
+        
+        # Fallback: Local
+        conn = sqlite3.connect(self.db_manager.local_db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        where_clauses = ["sync_status != 'pending_delete'"]
+        params = []
+        if "user_id" in self.query:
+            where_clauses.append("user_id = ?")
+            params.append(self.query["user_id"])
+        
+        q_str = f"SELECT * FROM {self.collection_name}"
+        if where_clauses:
+            q_str += " WHERE " + " AND ".join(where_clauses)
+            
+        if self.sort_params:
+            direction = "ASC" if self.sort_params[1] == 1 else "DESC"
+            q_str += f" ORDER BY {self.sort_params[0]} {direction}"
+            
+        cursor.execute(q_str, tuple(params))
+        rows = cursor.fetchall()
+        conn.close()
+        
+        self._data = []
+        for row in rows:
+            res = dict(row)
+            res["_id"] = ObjectId(res["_id"]) if ObjectId.is_valid(res["_id"]) else res["_id"]
+            self._data.append(res)
+
+    def __iter__(self):
+        self._fetch()
+        return iter(self._data)
+
+    def __len__(self):
+        self._fetch()
+        return len(self._data)
+
+# Global Instance
+db_instance = HybridDatabase()
+
+def get_db():
+    return db_instance
+
 def initialize_database():
-    db = get_db()
-    if db is None or db == "PLACEHOLDER": 
-        return
-    # MongoDB creates collections on first insert, but we can create indexes
-    try:
-        db.users.create_index("username", unique=True)
-        db.credentials.create_index([("user_id", pymongo.ASCENDING), ("title", pymongo.ASCENDING)])
-        db.credentials.create_index([("user_id", pymongo.ASCENDING), ("category", pymongo.ASCENDING)])
-        db.credentials.create_index([("user_id", pymongo.ASCENDING), ("updated_at", pymongo.DESCENDING)])
-    except Exception as e:
-        print(f"Error creating indexes: {e}")
+    # Already handled by HybridDatabase class
+    pass
 
 # ----------------------------- CRYPTO HELPERS -----------------------------
 def derive_key(master_password: str, salt: bytes, iterations=PBKDF2_ITERATIONS) -> bytes:
@@ -129,6 +440,7 @@ class PasswordManagerApp:
 
         self._running = True
         self.root.after(1000, self.check_inactivity)
+        self.root.after(2000, self.background_sync_loop)
 
     # ---------------- UI ----------------
     def setup_ui(self):
@@ -152,6 +464,15 @@ class PasswordManagerApp:
 
         self.build_login_tab()
         self.build_app_tab()
+        
+        # Status Bar
+        self.status_bar = tk.Frame(self.root, bd=1, relief='sunken', height=25)
+        self.status_bar.pack(side='bottom', fill='x')
+        self.status_label = tk.Label(self.status_bar, text="Checking connection...")
+        self.status_label.pack(side='left', padx=10)
+        self.sync_label = tk.Label(self.status_bar, text="")
+        self.sync_label.pack(side='right', padx=10)
+
         self.apply_theme()
 
     def build_login_tab(self):
@@ -245,13 +566,7 @@ class PasswordManagerApp:
             pw_hash = hash_master_password(p1)
             try:
                 db = get_db()
-                if db == "PLACEHOLDER":
-                    messagebox.showwarning("Setup Required", "Please update the MONGO_URI in your .env file with your real MongoDB Atlas connection string.")
-                    return
-                if db is None:
-                    messagebox.showerror("Error", "Could not connect to database.")
-                    return
-                    
+                
                 user_doc = {
                     "username": username,
                     "password_hash": pw_hash,
@@ -273,13 +588,7 @@ class PasswordManagerApp:
             messagebox.showerror("Error", "Enter username and password")
             return
         db = get_db()
-        if db == "PLACEHOLDER":
-            messagebox.showwarning("Setup Required", "Please update the MONGO_URI in your .env file with your real MongoDB Atlas connection string.")
-            return
-        if db is None:
-            messagebox.showerror("Error", "Could not connect to database. Please check your internet connection and MONGO_URI.")
-            return
-            
+        
         row = db.users.find_one({"username": username})
         if not row:
             messagebox.showerror("Error", "User not found")
@@ -635,6 +944,59 @@ class PasswordManagerApp:
 
     def mark_activity(self, event=None):
         self.last_activity = datetime.now()
+
+    # ---------------- Sync Logic ----------------
+    def background_sync_loop(self):
+        if not self._running:
+            return
+        
+        was_online = db_instance.online
+        is_now_online = db_instance.check_connection()
+        
+        status_text = "🟢 Online (MongoDB Atlas)" if is_now_online else "🔴 Offline (Local SQLite)"
+        self.status_label.config(text=status_text, fg="green" if is_now_online else "red")
+        
+        if is_now_online:
+            threading.Thread(target=self.perform_sync, daemon=True).start()
+            
+        self.root.after(10000, self.background_sync_loop)
+
+    def perform_sync(self):
+        if not db_instance.online or db_instance.mongo_db is None:
+            return
+            
+        try:
+            conn = sqlite3.connect(db_instance.local_db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            # 1. Handle pending saves/updates
+            cursor.execute("SELECT * FROM credentials WHERE sync_status = 'pending_save'")
+            pending = cursor.fetchall()
+            for p in pending:
+                doc = dict(p)
+                doc["_id"] = ObjectId(doc["_id"])
+                sync_id = doc.pop("_id")
+                doc.pop("sync_status")
+                # Upsert into Mongo
+                db_instance.mongo_db.credentials.replace_one({"_id": sync_id}, doc, upsert=True)
+                # Mark as synced locally
+                cursor.execute("UPDATE credentials SET sync_status = 'synced' WHERE _id = ?", (str(sync_id),))
+            
+            # 2. Handle pending deletes
+            cursor.execute("SELECT * FROM credentials WHERE sync_status = 'pending_delete'")
+            to_delete = cursor.fetchall()
+            for d in to_delete:
+                db_instance.mongo_db.credentials.delete_one({"_id": ObjectId(d["_id"])})
+                cursor.execute("DELETE FROM credentials WHERE _id = ?", (d["_id"],))
+            
+            conn.commit()
+            conn.close()
+            
+            if len(pending) > 0 or len(to_delete) > 0:
+                self.sync_label.config(text=f"Last Sync: {datetime.now().strftime('%H:%M:%S')} (Updated {len(pending)+len(to_delete)} items)")
+        except Exception as e:
+            print(f"Sync error: {e}")
 
     # ---------------- Clean shutdown ----------------
     def shutdown(self):
